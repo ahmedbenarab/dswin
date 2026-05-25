@@ -12,6 +12,9 @@
     "targets": ["msi", "nsis"],
     "externalBin": [],
     "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/256x256.png",
       "icons/icon.ico"
     ],
     "windows": {
@@ -25,7 +28,7 @@
   },
   "app": {
     "security": {
-      "csp": null,
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' https://fonts.gstatic.com; connect-src 'self' https://api.deepseek.com https://api.tavily.com",
       "dangerousDisableAssetCspModification": false,
       "assetProtocol": {
         "enable": true,
@@ -63,6 +66,22 @@
         "transparent": false,
         "alwaysOnTop": false,
         "skipTaskbar": false
+      },
+      {
+        "label": "mini",
+        "fullscreen": false,
+        "height": 520,
+        "minHeight": 300,
+        "resizable": true,
+        "title": "DeepSeek Quick",
+        "width": 600,
+        "center": true,
+        "visible": false,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "url": "mini.html"
       }
     ]
   },

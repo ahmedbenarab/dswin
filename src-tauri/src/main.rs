@@ -12,7 +12,10 @@ use tauri_plugin_clipboard_manager::ClipboardExt;
 use window_vibrancy::apply_mica;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Mutex;
 use base64::Engine;
+use futures_util::StreamExt;
+use chrono::Local;
 
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -32,8 +35,9 @@ struct Conversation {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct DeepSeekResponse {
+struct DeepSeekApiResponse {
     choices: Vec<Choice>,
+    usage: Option<Usage>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -44,6 +48,44 @@ struct Choice {
 #[derive(Debug, Serialize, Deserialize)]
 struct Message {
     content: String,
+    reasoning_content: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Usage {
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    total_tokens: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatResponse {
+    content: String,
+    reasoning: Option<String>,
+    usage: Option<Usage>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SearchResult {
+    title: String,
+    url: String,
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TavilySearchResponse {
+    results: Vec<TavilyResult>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TavilyResult {
+    title: String,
+    url: String,
+    content: String,
+}
+
+struct AppState {
+    cancellation_senders: Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>,
 }
 
 fn main() {
@@ -53,6 +95,7 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_window_state::Builder::default().build())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, shortcut, event| {
@@ -61,7 +104,7 @@ fn main() {
                             && shortcut.mods.contains(tauri_plugin_global_shortcut::Modifiers::SHIFT)
                             && shortcut.key == tauri_plugin_global_shortcut::Code::KeyD
                         {
-                            if let Some(window) = app.get_webview_window("main") {
+                            if let Some(window) = app.get_webview_window("mini") {
                                 if window.is_visible().unwrap_or(false) {
                                     let _ = window.hide();
                                 } else {
@@ -74,12 +117,32 @@ fn main() {
                 })
                 .build(),
         )
+        .manage(AppState {
+            cancellation_senders: Mutex::new(HashMap::new()),
+        })
         .setup(|app| {
-            let window = app.get_webview_window("main").unwrap();
+            let window = app.get_webview_window("main")
+                .ok_or("Main window not found")?;
             
-            // Apply Windows 11 Mica effect
+            // Apply Windows 11 Mica effect to main window
             #[cfg(target_os = "windows")]
             let _ = apply_mica(&window, Some(true));
+            
+            // Apply Mica to mini window
+            #[cfg(target_os = "windows")]
+            if let Some(mini) = app.get_webview_window("mini") {
+                let _ = apply_mica(&mini, Some(true));
+                
+                // Hide mini window when it loses focus
+                let mini_clone = mini.clone();
+                mini.on_window_event(move |event| {
+                    if let tauri::WindowEvent::Focused(is_focused) = event {
+                        if !is_focused {
+                            let _ = mini_clone.hide();
+                        }
+                    }
+                });
+            }
             
             // Initialize store for settings
             let _ = app.store("settings.json");
@@ -100,7 +163,7 @@ fn main() {
             let menu = Menu::with_items(app, &[&show_i, &hide_i, &quit_i])?;
             
             let _tray = TrayIconBuilder::new()
-                .icon(app.default_window_icon().unwrap().clone())
+                .icon(app.default_window_icon().ok_or("No default icon")?.clone())
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {
@@ -128,7 +191,8 @@ fn main() {
                     } = event
                     {
                         let app = tray.app_handle();
-                        if let Some(window) = app.get_webview_window("main") {
+                        // Toggle mini window on tray click for quick access
+                        if let Some(window) = app.get_webview_window("mini") {
                             if window.is_visible().unwrap_or(false) {
                                 let _ = window.hide();
                             } else {
@@ -148,6 +212,8 @@ fn main() {
             toggle_window, 
             minimize_window,
             toggle_maximize,
+            hide_mini_window,
+            open_main_window,
             save_api_key,
             get_api_key,
             get_model,
@@ -162,7 +228,15 @@ fn main() {
             get_rtl,
             save_sidebar,
             get_sidebar,
+            save_search_api_key,
+            get_search_api_key,
+            save_search_enabled,
+            get_search_enabled,
+            save_search_result_count,
+            get_search_result_count,
             send_message,
+            send_message_stream,
+            cancel_request,
             save_conversation,
             get_conversations,
             delete_conversation,
@@ -186,6 +260,22 @@ fn show_window(window: tauri::Window) {
 #[tauri::command]
 fn hide_window(window: tauri::Window) {
     let _ = window.hide();
+}
+
+#[tauri::command]
+fn hide_mini_window(app: tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("mini") {
+        let _ = window.hide();
+    }
+}
+
+#[tauri::command]
+fn open_main_window(app: tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.set_focus();
+        let _ = window.unminimize();
+    }
 }
 
 #[tauri::command]
@@ -313,58 +403,397 @@ fn get_sidebar(app: tauri::AppHandle) -> Result<Option<bool>, String> {
     Ok(store.get("sidebar_visible").and_then(|v| v.as_bool()))
 }
 
+async fn web_search(query: String, api_key: String, max_results: u32) -> Result<Vec<SearchResult>, String> {
+    let client = reqwest::Client::new();
+    
+    let request_body = serde_json::json!({
+        "api_key": api_key,
+        "query": query,
+        "search_depth": "basic",
+        "max_results": max_results,
+        "include_answer": false,
+    });
+    
+    let response = client
+        .post("https://api.tavily.com/search")
+        .header("Content-Type", "application/json")
+        .json(&request_body)
+        .send()
+        .await
+        .map_err(|e| format!("Search request failed: {}", e))?;
+    
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        return Err(format!("Search API Error {}: {}", status, text));
+    }
+    
+    let result: TavilySearchResponse = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse search response: {}", e))?;
+    
+    let search_results: Vec<SearchResult> = result.results.into_iter()
+        .map(|r| SearchResult {
+            title: r.title,
+            url: r.url,
+            content: r.content,
+        })
+        .collect();
+    
+    Ok(search_results)
+}
+
+fn format_search_context(results: Vec<SearchResult>) -> String {
+    let date = Local::now().format("%Y-%m-%d").to_string();
+    let mut context = format!(
+        "I searched the internet for the user's question. Today's date is {}. \
+        Use the following search results to answer. Cite sources by number like [1], [2]. \
+        If the results don't answer the question, say so honestly.\n\n",
+        date
+    );
+    
+    for (i, result) in results.iter().enumerate() {
+        context.push_str(&format!(
+            "[{}] {}\nSource: {}\n{}\n\n",
+            i + 1,
+            result.title,
+            result.url,
+            result.content.chars().take(1000).collect::<String>()
+        ));
+    }
+    
+    context.push_str("Now answer the user's question using the information above.");
+    context
+}
+
+#[tauri::command]
+fn save_search_api_key(app: tauri::AppHandle, api_key: String) -> Result<(), String> {
+    let store = app.store("settings.json").map_err(|e| e.to_string())?;
+    store.set("search_api_key", serde_json::Value::String(api_key));
+    store.save().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn get_search_api_key(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    let store = app.store("settings.json").map_err(|e| e.to_string())?;
+    Ok(store.get("search_api_key").and_then(|v| v.as_str().map(|s| s.to_string())))
+}
+
+#[tauri::command]
+fn save_search_enabled(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
+    let store = app.store("settings.json").map_err(|e| e.to_string())?;
+    store.set("search_enabled", serde_json::Value::Bool(enabled));
+    store.save().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn get_search_enabled(app: tauri::AppHandle) -> Result<Option<bool>, String> {
+    let store = app.store("settings.json").map_err(|e| e.to_string())?;
+    Ok(store.get("search_enabled").and_then(|v| v.as_bool()))
+}
+
+#[tauri::command]
+fn save_search_result_count(app: tauri::AppHandle, count: u32) -> Result<(), String> {
+    let store = app.store("settings.json").map_err(|e| e.to_string())?;
+    store.set("search_result_count", serde_json::Value::Number(serde_json::Number::from(count)));
+    store.save().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn get_search_result_count(app: tauri::AppHandle) -> Result<Option<u32>, String> {
+    let store = app.store("settings.json").map_err(|e| e.to_string())?;
+    Ok(store.get("search_result_count").and_then(|v| v.as_u64().map(|n| n as u32)))
+}
+
 #[tauri::command]
 async fn send_message(
+    app: tauri::AppHandle,
+    request_id: String,
     api_key: String,
     model: String,
     messages: Vec<HashMap<String, String>>,
     thinking: Option<HashMap<String, String>>,
     reasoning_effort: Option<String>,
-) -> Result<String, String> {
-    let client = reqwest::Client::new();
-    
-    // Build request body with optional thinking mode
-    let mut request_body = serde_json::json!({
-        "model": model,
-        "messages": messages,
-        "stream": false,
-    });
-    
-    // Add thinking mode if provided (for V4 Pro)
-    if let Some(thinking_map) = thinking {
-        request_body["thinking"] = serde_json::json!(thinking_map);
+    enable_search: Option<bool>,
+    search_api_key: Option<String>,
+    search_result_count: Option<u32>,
+) -> Result<ChatResponse, String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    {
+        let state = app.state::<AppState>();
+        let mut senders = state.cancellation_senders.lock().map_err(|e| e.to_string())?;
+        senders.insert(request_id.clone(), tx);
     }
     
-    // Add reasoning effort if provided
-    if let Some(effort) = reasoning_effort {
-        request_body["reasoning_effort"] = serde_json::json!(effort);
+    let result = async {
+        let mut augmented_messages = messages.clone();
+        
+        // Web search integration
+        if enable_search == Some(true) {
+            if let Some(search_key) = search_api_key.filter(|k| !k.is_empty()) {
+                let count = search_result_count.unwrap_or(3).max(1).min(5);
+                // Use the last user message as the search query
+                if let Some(last_user_msg) = messages.iter().rev().find(|m| m.get("role") == Some(&"user".to_string())) {
+                    if let Some(query) = last_user_msg.get("content") {
+                        match web_search(query.clone(), search_key, count).await {
+                            Ok(results) if !results.is_empty() => {
+                                let search_context = format_search_context(results);
+                                // Insert search context as a user message right before the last user message
+                                let last_user_idx = augmented_messages.iter().rposition(|m| m.get("role") == Some(&"user".to_string()));
+                                let insert_idx = last_user_idx.unwrap_or(augmented_messages.len());
+                                let mut new_msg = HashMap::new();
+                                new_msg.insert("role".to_string(), "user".to_string());
+                                new_msg.insert("content".to_string(), search_context);
+                                augmented_messages.insert(insert_idx, new_msg);
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                return Err(format!("Web search failed: {}. Disable search or check your Tavily API key.", e));
+                            }
+                        }
+                    }
+                }
+            } else {
+                return Err("Search is enabled but no Tavily API key is configured. Add your key in Settings > Web Search.".to_string());
+            }
+        }
+        
+        let client = reqwest::Client::new();
+        
+        let mut request_body = serde_json::json!({
+            "model": model,
+            "messages": augmented_messages,
+            "stream": false,
+        });
+        
+        if let Some(thinking_map) = thinking {
+            request_body["thinking"] = serde_json::json!(thinking_map);
+        }
+        
+        if let Some(effort) = reasoning_effort {
+            request_body["reasoning_effort"] = serde_json::json!(effort);
+        }
+        
+        let response = client
+            .post("https://api.deepseek.com/chat/completions")
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .json(&request_body)
+            .send()
+            .await
+            .map_err(|e| format!("Request failed: {}", e))?;
+        
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            return Err(format!("API Error {}: {}", status, text));
+        }
+        
+        let result: DeepSeekApiResponse = response
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse response: {}", e))?;
+        
+        if let Some(choice) = result.choices.first() {
+            Ok(ChatResponse {
+                content: choice.message.content.clone(),
+                reasoning: choice.message.reasoning_content.clone(),
+                usage: result.usage,
+            })
+        } else {
+            Err("No response from DeepSeek".to_string())
+        }
+    };
+    
+    let output = tokio::select! {
+        res = result => res,
+        _ = rx => Err("Request cancelled by user".to_string()),
+    };
+    
+    {
+        let state = app.state::<AppState>();
+        let mut senders = state.cancellation_senders.lock().map_err(|e| e.to_string())?;
+        senders.remove(&request_id);
     }
     
-    let response = client
-        .post("https://api.deepseek.com/chat/completions")
-        .header("Authorization", format!("Bearer {}", api_key))
-        .header("Content-Type", "application/json")
-        .json(&request_body)
-        .send()
-        .await
-        .map_err(|e| format!("Request failed: {}", e))?;
-    
-    if !response.status().is_success() {
-        let status = response.status();
-        let text = response.text().await.unwrap_or_default();
-        return Err(format!("API Error {}: {}", status, text));
+    output
+}
+
+#[derive(Clone, serde::Serialize)]
+struct StreamChunk {
+    chunk: String,
+    reasoning_chunk: Option<String>,
+    done: bool,
+}
+
+#[tauri::command]
+async fn send_message_stream(
+    app: tauri::AppHandle,
+    request_id: String,
+    api_key: String,
+    model: String,
+    messages: Vec<HashMap<String, String>>,
+    thinking: Option<HashMap<String, String>>,
+    reasoning_effort: Option<String>,
+    enable_search: Option<bool>,
+    search_api_key: Option<String>,
+    search_result_count: Option<u32>,
+    on_chunk: tauri::ipc::Channel<StreamChunk>,
+) -> Result<Option<Usage>, String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    {
+        let state = app.state::<AppState>();
+        let mut senders = state.cancellation_senders.lock().map_err(|e| e.to_string())?;
+        senders.insert(request_id.clone(), tx);
     }
     
-    let result: DeepSeekResponse = response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse response: {}", e))?;
+    let result = async {
+        let mut augmented_messages = messages.clone();
+        
+        // Web search integration
+        if enable_search == Some(true) {
+            if let Some(search_key) = search_api_key.filter(|k| !k.is_empty()) {
+                let count = search_result_count.unwrap_or(3).max(1).min(5);
+                if let Some(last_user_msg) = messages.iter().rev().find(|m| m.get("role") == Some(&"user".to_string())) {
+                    if let Some(query) = last_user_msg.get("content") {
+                        match web_search(query.clone(), search_key, count).await {
+                            Ok(results) if !results.is_empty() => {
+                                let search_context = format_search_context(results);
+                                let last_user_idx = augmented_messages.iter().rposition(|m| m.get("role") == Some(&"user".to_string()));
+                                let insert_idx = last_user_idx.unwrap_or(augmented_messages.len());
+                                let mut new_msg = HashMap::new();
+                                new_msg.insert("role".to_string(), "user".to_string());
+                                new_msg.insert("content".to_string(), search_context);
+                                augmented_messages.insert(insert_idx, new_msg);
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                return Err(format!("Web search failed: {}. Disable search or check your Tavily API key.", e));
+                            }
+                        }
+                    }
+                }
+            } else {
+                return Err("Search is enabled but no Tavily API key is configured. Add your key in Settings > Web Search.".to_string());
+            }
+        }
+        
+        let client = reqwest::Client::new();
+        
+        let mut request_body = serde_json::json!({
+            "model": model,
+            "messages": augmented_messages,
+            "stream": true,
+        });
+        
+        if let Some(thinking_map) = thinking {
+            request_body["thinking"] = serde_json::json!(thinking_map);
+        }
+        
+        if let Some(effort) = reasoning_effort {
+            request_body["reasoning_effort"] = serde_json::json!(effort);
+        }
+        
+        let response = client
+            .post("https://api.deepseek.com/chat/completions")
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .json(&request_body)
+            .send()
+            .await
+            .map_err(|e| format!("Request failed: {}", e))?;
+        
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            return Err(format!("API Error {}: {}", status, text));
+        }
+        
+        let mut stream = response.bytes_stream();
+        let mut usage: Option<Usage> = None;
+        
+        while let Some(chunk_result) = stream.next().await {
+            let chunk = chunk_result.map_err(|e| format!("Stream error: {}", e))?;
+            let text = String::from_utf8_lossy(&chunk);
+            
+            for line in text.lines() {
+                let line = line.trim();
+                if line.is_empty() || line == ": keep-alive" {
+                    continue;
+                }
+                
+                if line == "data: [DONE]" {
+                    on_chunk.send(StreamChunk {
+                        chunk: String::new(),
+                        reasoning_chunk: None,
+                        done: true,
+                    }).ok();
+                    continue;
+                }
+                
+                if let Some(data) = line.strip_prefix("data: ") {
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
+                        // Extract usage from final chunk
+                        if let Some(u) = json.get("usage") {
+                            usage = serde_json::from_value(u.clone()).ok();
+                        }
+                        
+                        if let Some(choices) = json.get("choices") {
+                            if let Some(first) = choices.get(0) {
+                                if let Some(delta) = first.get("delta") {
+                                    let content = delta.get("content")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    
+                                    let reasoning = delta.get("reasoning_content")
+                                        .and_then(|v| v.as_str())
+                                        .map(|s| s.to_string());
+                                    
+                                    if !content.is_empty() || reasoning.is_some() {
+                                        on_chunk.send(StreamChunk {
+                                            chunk: content,
+                                            reasoning_chunk: reasoning,
+                                            done: false,
+                                        }).ok();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        Ok(usage)
+    };
     
-    if let Some(choice) = result.choices.first() {
-        Ok(choice.message.content.clone())
-    } else {
-        Err("No response from DeepSeek".to_string())
+    let output = tokio::select! {
+        res = result => res,
+        _ = rx => Err("Request cancelled by user".to_string()),
+    };
+    
+    {
+        let state = app.state::<AppState>();
+        let mut senders = state.cancellation_senders.lock().map_err(|e| e.to_string())?;
+        senders.remove(&request_id);
     }
+    
+    output
+}
+
+#[tauri::command]
+fn cancel_request(app: tauri::AppHandle, request_id: String) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let mut senders = state.cancellation_senders.lock().map_err(|e| e.to_string())?;
+    if let Some(tx) = senders.remove(&request_id) {
+        let _ = tx.send(());
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -476,7 +905,7 @@ async fn take_screenshot() -> Result<HashMap<String, String>, String> {
     let temp_dir = std::env::temp_dir();
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .map_err(|e| format!("System time error: {}", e))?
         .as_secs();
     let screenshot_path = temp_dir.join(format!("deepseek_screenshot_{}.png", timestamp));
     
@@ -586,7 +1015,7 @@ fn extract_text_from_pdf(base64_data: String) -> Result<String, String> {
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .map_err(|e| format!("System time error: {}", e))?
         .as_secs();
     let tmp = std::env::temp_dir().join(format!("deepseek_pdf_{}.pdf", timestamp));
 
