@@ -1,0 +1,76 @@
+{
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "../dist"
+  },
+  "bundle": {
+    "active": true,
+    "category": "Productivity",
+    "copyright": "",
+    "targets": ["msi", "nsis"],
+    "externalBin": [],
+    "icon": [
+      "icons/icon.ico"
+    ],
+    "windows": {
+      "certificateThumbprint": null,
+      "digestAlgorithm": "sha256",
+      "timestampUrl": ""
+    },
+    "longDescription": "Native Windows 11 app for DeepSeek AI with Mica design",
+    "shortDescription": "DeepSeek AI - Native Windows 11",
+    "publisher": "DeepSeek"
+  },
+  "app": {
+    "security": {
+      "csp": null,
+      "dangerousDisableAssetCspModification": false,
+      "assetProtocol": {
+        "enable": true,
+        "scope": ["$APPDATA/**", "$TEMP/**"]
+      }
+    },
+    "windows": [
+      {
+        "fullscreen": false,
+        "height": 900,
+        "resizable": true,
+        "title": "DeepSeek",
+        "width": 1400,
+        "minWidth": 800,
+        "minHeight": 600,
+        "center": true,
+        "visible": true,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": false,
+        "skipTaskbar": false
+      },
+      {
+        "label": "settings",
+        "fullscreen": false,
+        "height": 700,
+        "resizable": true,
+        "title": "DeepSeek - Settings",
+        "width": 600,
+        "minWidth": 500,
+        "minHeight": 500,
+        "center": true,
+        "visible": false,
+        "decorations": true,
+        "transparent": false,
+        "alwaysOnTop": false,
+        "skipTaskbar": false
+      }
+    ]
+  },
+  "plugins": {
+    "globalShortcut": {
+      "shortcuts": ["Ctrl+Shift+D"]
+    }
+  },
+  "identifier": "com.deepseek.app",
+  "productName": "DeepSeek"
+}
