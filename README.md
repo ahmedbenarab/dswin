@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="src-tauri/icons/256x256.png" alt="DeepSeek" width="96" height="96">
+<img src="https://raw.githubusercontent.com/ahmedbenarab/dswin/refs/heads/master/src-tauri/icons/icon.ico" alt="DeepSeek" width="96" height="96">
 
 # DeepSeek for Windows
 
