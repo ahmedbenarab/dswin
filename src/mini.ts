@@ -9,6 +9,10 @@ const messagesArea = document.getElementById("messagesArea") as HTMLDivElement;
 const errorToast = document.getElementById("errorToast") as HTMLDivElement;
 const openMainBtn = document.getElementById("openMainBtn") as HTMLButtonElement;
 const closeBtn = document.getElementById("closeBtn") as HTMLButtonElement;
+const newChatBtn = document.getElementById("newChatBtn") as HTMLButtonElement;
+const attachBtn = document.getElementById("attachBtn") as HTMLButtonElement;
+const fileInput = document.getElementById("fileInput") as HTMLInputElement;
+const dragOverlay = document.getElementById("dragOverlay") as HTMLDivElement;
 
 // State
 let apiKey: string | null = null;
@@ -45,6 +49,70 @@ function generateId(): string {
     return Date.now().toString(36) + Math.random().toString(36).substr(2);
 }
 
+function readFileAsDataURL(file: File): Promise<string> {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = (e) => resolve(e.target?.result as string);
+        reader.onerror = reject;
+        reader.readAsDataURL(file);
+    });
+}
+
+async function handleFile(file: File) {
+    const MAX_FILE_SIZE_MB = 50;
+    if (file.size > MAX_FILE_SIZE_MB * 1024 * 1024) {
+        showError(`File too large. Max ${MAX_FILE_SIZE_MB}MB.`);
+        return;
+    }
+
+    const fileName = file.name;
+    const fileExtension = fileName.split('.').pop()?.toLowerCase() || '';
+
+    const imageExtensions = ['png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp'];
+    if (imageExtensions.includes(fileExtension)) {
+        try {
+            const dataUrl = await readFileAsDataURL(file);
+            const base64Data = dataUrl.split(',')[1];
+            const extractedText = await invoke<string>("extract_text_from_image", { base64Data });
+            if (extractedText !== "No text found in image") {
+                miniInput.value = `[Image: ${fileName}]\n\n${extractedText}\n\nAnalyze this.`;
+            } else {
+                showError("No text found in the image.");
+            }
+        } catch (error) {
+            showError("Failed to extract text from image.");
+        }
+        miniInput.focus();
+        return;
+    }
+
+    if (fileExtension === 'pdf') {
+        try {
+            const dataUrl = await readFileAsDataURL(file);
+            const base64Data = dataUrl.split(',')[1];
+            const extractedText = await invoke<string>("extract_text_from_pdf", { base64Data });
+            if (extractedText !== "No text found in PDF") {
+                miniInput.value = `[PDF: ${fileName}]\n\n${extractedText}\n\nSummarize this document.`;
+            } else {
+                showError("No text found in the PDF.");
+            }
+        } catch (error) {
+            showError("Failed to extract text from PDF.");
+        }
+        miniInput.focus();
+        return;
+    }
+
+    const text = await file.text();
+    const codeExtensions = ['js', 'ts', 'html', 'css', 'py', 'java', 'cpp', 'c', 'h', 'rs', 'go', 'rb', 'php', 'sql', 'json', 'xml', 'yaml', 'yml', 'ini', 'cfg', 'log'];
+    if (codeExtensions.includes(fileExtension)) {
+        miniInput.value = `Here's a ${fileExtension.toUpperCase()} file "${fileName}":\n\n\`\`\`${fileExtension}\n${text}\n\`\`\`\n\nAnalyze this code.`;
+    } else {
+        miniInput.value = `Here's "${fileName}":\n\n${text}\n\nAnalyze this.`;
+    }
+    miniInput.focus();
+}
+
 // Load settings
 async function loadSettings() {
     try {
@@ -73,7 +141,7 @@ function showError(message: string) {
 function addMessage(text: string, role: "user" | "assistant") {
     const msgDiv = document.createElement("div");
     msgDiv.className = `msg ${role}`;
-    const icon = role === "user" ? "U" : `<img src="/deepseek-icon.png" alt="D" />`;
+    const icon = role === "user" ? "U" : `<img src="/deepseek-icon.png" alt="D" width="24" height="24" style="display:block;" />`;
     const bubbleContent = role === "assistant" ? renderMarkdown(text) : escapeHtml(text);
     msgDiv.innerHTML = `
         <div class="msg-avatar">${icon}</div>
@@ -90,7 +158,7 @@ function addTypingIndicator(): HTMLDivElement {
     typingDiv.className = "typing-msg";
     typingDiv.id = "typingMsg";
     typingDiv.innerHTML = `
-        <div class="msg-avatar"><img src="/deepseek-icon.png" alt="D" /></div>
+        <div class="msg-avatar"><img src="/deepseek-icon.png" alt="D" width="24" height="24" style="display:block;" /></div>
         <div class="typing-dots">
             <div class="dot"></div>
             <div class="dot"></div>
@@ -197,6 +265,52 @@ miniInput?.addEventListener("keydown", (e) => {
 
 openMainBtn?.addEventListener("click", openMainApp);
 closeBtn?.addEventListener("click", hideWindow);
+newChatBtn?.addEventListener("click", () => {
+    messagesArea.innerHTML = "";
+    miniInput?.focus();
+});
+
+// Attach file button
+attachBtn?.addEventListener("click", () => {
+    fileInput?.click();
+});
+
+fileInput?.addEventListener("change", async () => {
+    const file = fileInput.files?.[0];
+    if (file) {
+        await handleFile(file);
+    }
+    fileInput.value = '';
+});
+
+// Drag and drop via standard DOM events
+let miniDragTimeout: ReturnType<typeof setTimeout> | null = null;
+
+document.addEventListener('dragenter', (e) => {
+    e.preventDefault();
+    if (miniDragTimeout) clearTimeout(miniDragTimeout);
+    dragOverlay.classList.add('active');
+});
+
+document.addEventListener('dragleave', () => {
+    miniDragTimeout = setTimeout(() => {
+        dragOverlay.classList.remove('active');
+    }, 80);
+});
+
+document.addEventListener('dragover', (e) => {
+    e.preventDefault();
+});
+
+document.addEventListener('drop', async (e) => {
+    e.preventDefault();
+    if (miniDragTimeout) clearTimeout(miniDragTimeout);
+    dragOverlay.classList.remove('active');
+    const files = e.dataTransfer?.files;
+    if (files && files.length > 0) {
+        await handleFile(files[0]);
+    }
+});
 
 // Focus input when window is shown
 document.addEventListener("visibilitychange", () => {

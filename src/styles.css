@@ -49,7 +49,6 @@
             color: var(--text-primary);
             height: 100vh;
             overflow: hidden;
-            user-select: none;
         }
         
         .app-container {
@@ -76,6 +75,7 @@
             -webkit-app-region: drag;
             position: relative;
             z-index: 1000;
+            user-select: none;
             transition: background 0.3s ease, border-color 0.3s ease;
         }
         
@@ -184,6 +184,7 @@
             flex-direction: column;
             padding: 12px;
             gap: 8px;
+            user-select: none;
             transition: background 0.3s ease, border-color 0.3s ease;
         }
         
@@ -645,6 +646,7 @@
             display: flex;
             align-items: center;
             justify-content: space-between;
+            user-select: none;
             transition: border-color 0.3s ease;
         }
         
@@ -774,6 +776,7 @@
             font-size: 14px;
             line-height: 1.7;
             color: var(--text-primary);
+            user-select: text;
         }
         
         .message-content h1, .message-content h2, .message-content h3, 
@@ -988,6 +991,7 @@
         .input-container {
             padding: 16px 24px 24px;
             border-top: 1px solid var(--border);
+            user-select: none;
             transition: border-color 0.3s ease;
         }
         
@@ -1096,24 +1100,44 @@
             left: 0;
             right: 0;
             bottom: 0;
-            background: rgba(79, 140, 255, 0.2);
+            background: rgba(79, 140, 255, 0.12);
             border: 3px dashed var(--accent);
-            display: none;
+            display: flex;
             align-items: center;
             justify-content: center;
             z-index: 2000;
             pointer-events: none;
+            opacity: 0;
+            visibility: hidden;
+            transition: opacity 0.25s ease, visibility 0.25s ease;
         }
         
         .drag-overlay.active {
-            display: flex;
+            opacity: 1;
+            visibility: visible;
         }
-        
+
         .drag-overlay-content {
             text-align: center;
             color: var(--text-primary);
             font-size: 18px;
             font-weight: 600;
+            animation: dragPulse 1.2s ease-in-out infinite;
+        }
+
+        .drag-overlay-content i {
+            display: inline-block;
+            animation: dragFloat 2s ease-in-out infinite;
+        }
+
+        @keyframes dragPulse {
+            0%, 100% { transform: scale(1); }
+            50% { transform: scale(1.04); }
+        }
+
+        @keyframes dragFloat {
+            0%, 100% { transform: translateY(0); }
+            50% { transform: translateY(-6px); }
         }
         
         /* Scrollbar */

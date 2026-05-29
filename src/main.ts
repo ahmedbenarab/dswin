@@ -50,6 +50,7 @@ let searchResultCount = 3;
 let reasoningEffort = "high";
 let sidebarVisible = true;
 let isRTL = false;
+let closeToTray = true;
 let abortController: AbortController | null = null;
 let currentRequestId: string | null = null;
 
@@ -91,6 +92,8 @@ const searchClear = document.getElementById("searchClear") as HTMLButtonElement;
 const systemPresetSelect = document.getElementById("systemPresetSelect") as HTMLSelectElement;
 const exportChatBtn = document.getElementById("exportChatBtn") as HTMLButtonElement;
 const searchToggleBtn = document.getElementById("searchToggleBtn") as HTMLButtonElement;
+const closeToTrayToggle = document.getElementById("closeToTrayToggle") as HTMLDivElement;
+const closeToTraySwitch = document.getElementById("closeToTraySwitch") as HTMLDivElement;
 
 // State
 let currentSystemPrompt = "You are a helpful AI assistant.";
@@ -155,7 +158,11 @@ function updateMaximizeIcon() {
 }
 
 closeBtn?.addEventListener("click", () => {
-    invoke("hide_window");
+    if (closeToTray) {
+        invoke("hide_window");
+    } else {
+        invoke("quit_app");
+    }
 });
 
 // Settings Modal
@@ -255,6 +262,41 @@ async function loadSidebar() {
         }
     } catch (error) {
         console.error("Failed to load sidebar:", error);
+    }
+}
+
+// Close-to-tray Toggle
+closeToTrayToggle?.addEventListener("click", async () => {
+    closeToTray = !closeToTray;
+    updateCloseToTrayUI();
+    await saveCloseToTray(closeToTray);
+});
+
+function updateCloseToTrayUI() {
+    if (closeToTray) {
+        closeToTraySwitch.classList.add("active");
+    } else {
+        closeToTraySwitch.classList.remove("active");
+    }
+}
+
+async function saveCloseToTray(enabled: boolean) {
+    try {
+        await invoke("save_close_to_tray", { enabled });
+    } catch (error) {
+        console.error("Failed to save close-to-tray:", error);
+    }
+}
+
+async function loadCloseToTray() {
+    try {
+        const enabled = await invoke<boolean | null>("get_close_to_tray");
+        if (enabled !== null) {
+            closeToTray = enabled;
+            updateCloseToTrayUI();
+        }
+    } catch (error) {
+        console.error("Failed to load close-to-tray:", error);
     }
 }
 
@@ -1557,276 +1599,166 @@ function attachQuickActionListeners() {
     });
 }
 
-// File handling
+// Shared processing for images and PDFs — adds to UI, saves conversation, sends to AI
+async function processFileResult(
+    fileName: string,
+    fileType: "image" | "pdf",
+    base64Data: string,
+    extractedText: string
+) {
+    if (!currentConversationId) {
+        const conversation = createNewConversation();
+        currentConversationId = conversation.id;
+        await saveConversation(conversation);
+        loadConversations();
+    }
+
+    const prompt = fileType === "image"
+        ? `I've uploaded an image "${fileName}". Here's what I found:`
+        : `I've uploaded a PDF "${fileName}". Here's the content:`;
+
+    addMessageToUI(prompt, "user", undefined, base64Data, extractedText);
+    await saveCurrentConversation(prompt + "\n\n" + extractedText, "");
+
+    if (!apiKey || extractedText === `No text found in ${fileType}`) {
+        if (extractedText === `No text found in ${fileType}`) {
+            addMessageToUI(
+                `No text was found in this ${fileType}. It may contain only graphics or scanned content.`,
+                "assistant"
+            );
+            await saveResponseToConversation(
+                `No text was found in this ${fileType}. It may contain only graphics or scanned content.`
+            );
+        }
+        return;
+    }
+
+    isLoading = true;
+    sendBtn.style.display = "none";
+    stopBtn.classList.add("visible");
+    showTypingIndicator();
+
+    abortController = new AbortController();
+    const signal = abortController.signal;
+
+    try {
+        const history = await getConversationMessages();
+        const apiMessages = buildApiMessages(
+            "You are a helpful AI assistant. Analyze the extracted content and provide insights.",
+            history
+        );
+
+        const requestBody: any = {
+            apiKey,
+            model: currentModel,
+            messages: apiMessages,
+            enableSearch: searchEnabled,
+            searchApiKey: searchApiKey || undefined,
+            searchResultCount: searchResultCount || undefined,
+        };
+
+        if (currentModel === "deepseek-v4-pro" && thinkingEnabled) {
+            requestBody.thinking = { type: "enabled" };
+            requestBody.reasoning_effort = reasoningEffort;
+        }
+
+        currentRequestId = generateId();
+        requestBody.requestId = currentRequestId;
+        const response = await invoke<{content: string; usage: TokenUsage; reasoning?: string}>("send_message", requestBody);
+
+        if (signal.aborted) return;
+        hideTypingIndicator();
+        addMessageToUI(response.content, "assistant", undefined, undefined, undefined, response.usage, response.reasoning);
+        await saveResponseToConversation(response.content, response.usage, response.reasoning);
+    } catch (error) {
+        if (signal.aborted) return;
+        hideTypingIndicator();
+        const errorMsg = String(error);
+        if (!errorMsg.includes("cancelled")) {
+            addMessageToUI(`Error: ${error}`, "assistant");
+        }
+    } finally {
+        currentRequestId = null;
+        if (!signal.aborted) {
+            isLoading = false;
+            sendBtn.style.display = "flex";
+            stopBtn.classList.remove("visible");
+        }
+        abortController = null;
+    }
+}
+
+
+function readFileAsDataURL(file: File): Promise<string> {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = (e) => resolve(e.target?.result as string);
+        reader.onerror = reject;
+        reader.readAsDataURL(file);
+    });
+}
+
 async function handleFile(file: File) {
     const MAX_FILE_SIZE_MB = 50;
     if (file.size > MAX_FILE_SIZE_MB * 1024 * 1024) {
         showToast(`File too large. Maximum size is ${MAX_FILE_SIZE_MB}MB.`, "error");
         return;
     }
-    
+
     const fileName = file.name;
     const fileExtension = fileName.split('.').pop()?.toLowerCase() || '';
-    
-    // Image files
+
     const imageExtensions = ['png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp'];
     if (imageExtensions.includes(fileExtension)) {
-        const reader = new FileReader();
-        reader.onload = async (e) => {
-            const base64Data = (e.target?.result as string).split(',')[1];
-            
-            // Create conversation if none exists
-            if (!currentConversationId) {
-                const conversation = createNewConversation();
-                currentConversationId = conversation.id;
-                await saveConversation(conversation);
-                loadConversations();
-            }
-            
-            // Show loading
+        try {
+            const dataUrl = await readFileAsDataURL(file);
+            const base64Data = dataUrl.split(',')[1];
             const loadingDiv = document.createElement("div");
             loadingDiv.className = "message user";
-            loadingDiv.innerHTML = `
-                <div class="message-avatar"><i data-lucide="user"></i></div>
-                <div>
-                    <div class="message-content">
-                        <div class="ocr-loading">
-                            <div class="spinner"></div>
-                            <span>Extracting text from image...</span>
-                        </div>
-                    </div>
-                </div>
-            `;
+            loadingDiv.innerHTML = `<div class="message-avatar"><i data-lucide="user"></i></div><div><div class="message-content"><div class="ocr-loading"><div class="spinner"></div><span>Extracting text from image...</span></div></div></div>`;
             messagesContainer.appendChild(loadingDiv);
             renderIcons(loadingDiv);
             messagesContainer.scrollTop = messagesContainer.scrollHeight;
-            
-            try {
-                // Extract text using OCR
-                const extractedText = await invoke<string>("extract_text_from_image", { base64Data });
-                
-                // Remove loading
-                loadingDiv.remove();
-                
-                const prompt = `I've uploaded an image "${fileName}". Here's what I found:`;
-                addMessageToUI(prompt, "user", undefined, base64Data, extractedText);
-                
-                // Save user message first
-                await saveCurrentConversation(prompt + "\n\n" + extractedText, "");
-                
-                // If we have API key and text was found, send to AI
-                if (apiKey && extractedText !== "No text found in image") {
-                    isLoading = true;
-                    sendBtn.style.display = "none";
-                    stopBtn.classList.add("visible");
-                    showTypingIndicator();
-                    
-                    abortController = new AbortController();
-                    const signal = abortController.signal;
-                    
-                    try {
-                        const history = await getConversationMessages();
-                        const apiMessages = buildApiMessages(
-                            "You are a helpful AI assistant. Analyze the extracted text from an image and provide insights.",
-                            history
-                        );
-                        
-                        const requestBody: any = {
-                            apiKey,
-                            model: currentModel,
-                            messages: apiMessages,
-                            enableSearch: searchEnabled,
-                            searchApiKey: searchApiKey || undefined,
-                            searchResultCount: searchResultCount || undefined,
-                        };
-                        
-                        if (currentModel === "deepseek-v4-pro" && thinkingEnabled) {
-                            requestBody.thinking = { type: "enabled" };
-                            requestBody.reasoning_effort = reasoningEffort;
-                        }
-                        
-                        currentRequestId = generateId();
-                        requestBody.requestId = currentRequestId;
-                        const response = await invoke<{content: string; usage?: {prompt_tokens: number; completion_tokens: number; total_tokens: number}; reasoning?: string}>("send_message", requestBody);
-                        
-                        if (signal.aborted) return;
-                        
-                        hideTypingIndicator();
-                        addMessageToUI(response.content, "assistant", undefined, undefined, undefined, response.usage, response.reasoning);
-                        await saveResponseToConversation(response.content, response.usage, response.reasoning);
-                    } catch (error) {
-                        if (signal.aborted) return;
-                        hideTypingIndicator();
-                        const errorMsg = String(error);
-                        if (!errorMsg.includes("cancelled")) {
-                            addMessageToUI(`Error: ${error}`, "assistant");
-                        }
-                    } finally {
-                        currentRequestId = null;
-                        if (!signal.aborted) {
-                            isLoading = false;
-                            sendBtn.style.display = "flex";
-                            stopBtn.classList.remove("visible");
-                        }
-                        abortController = null;
-                    }
-                } else if (extractedText === "No text found in image") {
-                    addMessageToUI("No text was found in this image. The image may contain only graphics or photos.", "assistant");
-                    await saveResponseToConversation("No text was found in this image. The image may contain only graphics or photos.");
-                }
-            } catch (error) {
-                loadingDiv.remove();
-                console.error("OCR failed:", error);
-                addMessageToUI(`Failed to extract text from image: ${error}`, "user", undefined, base64Data);
-            }
-        };
-        reader.readAsDataURL(file);
+
+            const extractedText = await invoke<string>("extract_text_from_image", { base64Data });
+            loadingDiv.remove();
+            await processFileResult(fileName, "image", base64Data, extractedText);
+        } catch (error) {
+            showToast(`Failed to process image: ${error}`, "error");
+        }
         return;
     }
-    
-    // PDF files
+
     if (fileExtension === 'pdf') {
-        const reader = new FileReader();
-        reader.onload = async (e) => {
-            const base64Data = (e.target?.result as string).split(',')[1];
-            
-            // Create conversation if none exists
-            if (!currentConversationId) {
-                const conversation = createNewConversation();
-                currentConversationId = conversation.id;
-                await saveConversation(conversation);
-                loadConversations();
-            }
-            
+        try {
+            const dataUrl = await readFileAsDataURL(file);
+            const base64Data = dataUrl.split(',')[1];
             const loadingDiv = document.createElement("div");
             loadingDiv.className = "message user";
-            loadingDiv.innerHTML = `
-                <div class="message-avatar"><i data-lucide="user"></i></div>
-                <div>
-                    <div class="message-content">
-                        <div class="ocr-loading">
-                            <div class="spinner"></div>
-                            <span>Extracting text from PDF...</span>
-                        </div>
-                    </div>
-                </div>
-            `;
+            loadingDiv.innerHTML = `<div class="message-avatar"><i data-lucide="user"></i></div><div><div class="message-content"><div class="ocr-loading"><div class="spinner"></div><span>Extracting text from PDF...</span></div></div></div>`;
             messagesContainer.appendChild(loadingDiv);
             renderIcons(loadingDiv);
             messagesContainer.scrollTop = messagesContainer.scrollHeight;
-            
-            try {
-                const extractedText = await invoke<string>("extract_text_from_pdf", { base64Data });
-                
-                loadingDiv.remove();
-                
-                const prompt = `I've uploaded a PDF "${fileName}". Here's the content:`;
-                const fileIndicator = `<div class="message-file"><i data-lucide="file-text"></i> ${fileName}</div>`;
-                
-                // Add user message with file indicator and extracted text
-                const msgDiv = document.createElement("div");
-                msgDiv.className = "message user";
-                msgDiv.innerHTML = `
-                    <div class="message-avatar"><i data-lucide="user"></i></div>
-                    <div>
-                        <div class="message-content">
-                            ${escapeHtml(prompt)}
-                            ${fileIndicator}
-                            <div class="extracted-text-container">
-                                <div class="extracted-text-label">Extracted Text</div>
-                                <div class="extracted-text">${escapeHtml(extractedText)}</div>
-                            </div>
-                        </div>
-                        <div class="message-time">${new Date().toLocaleTimeString()}</div>
-                    </div>
-                `;
-                messagesContainer.appendChild(msgDiv);
-                renderIcons(msgDiv);
-                messagesContainer.scrollTop = messagesContainer.scrollHeight;
-                
-                // Save user message first
-                await saveCurrentConversation(prompt + "\n\n" + extractedText, "");
-                
-                if (apiKey && extractedText !== "No text found in PDF") {
-                    isLoading = true;
-                    sendBtn.style.display = "none";
-                    stopBtn.classList.add("visible");
-                    showTypingIndicator();
-                    
-                    abortController = new AbortController();
-                    const signal = abortController.signal;
-                    
-                    try {
-                        const history = await getConversationMessages();
-                        const apiMessages = buildApiMessages(
-                            "You are a helpful AI assistant. Analyze the extracted text from a PDF and provide insights.",
-                            history
-                        );
-                        
-                        const requestBody: any = {
-                            apiKey,
-                            model: currentModel,
-                            messages: apiMessages,
-                            enableSearch: searchEnabled,
-                            searchApiKey: searchApiKey || undefined,
-                            searchResultCount: searchResultCount || undefined,
-                        };
-                        
-                        if (currentModel === "deepseek-v4-pro" && thinkingEnabled) {
-                            requestBody.thinking = { type: "enabled" };
-                            requestBody.reasoning_effort = reasoningEffort;
-                        }
-                        
-                        currentRequestId = generateId();
-                        requestBody.requestId = currentRequestId;
-                        const response = await invoke<{content: string; usage?: {prompt_tokens: number; completion_tokens: number; total_tokens: number}; reasoning?: string}>("send_message", requestBody);
-                        
-                        if (signal.aborted) return;
-                        
-                        hideTypingIndicator();
-                        addMessageToUI(response.content, "assistant", undefined, undefined, undefined, response.usage, response.reasoning);
-                        await saveResponseToConversation(response.content, response.usage, response.reasoning);
-                    } catch (error) {
-                        if (signal.aborted) return;
-                        hideTypingIndicator();
-                        const errorMsg = String(error);
-                        if (!errorMsg.includes("cancelled")) {
-                            addMessageToUI(`Error: ${error}`, "assistant");
-                        }
-                    } finally {
-                        currentRequestId = null;
-                        if (!signal.aborted) {
-                            isLoading = false;
-                            sendBtn.style.display = "flex";
-                            stopBtn.classList.remove("visible");
-                        }
-                        abortController = null;
-                    }
-                } else if (extractedText === "No text found in PDF") {
-                    addMessageToUI("No text was found in this PDF. It may contain only images or scanned content.", "assistant");
-                    await saveResponseToConversation("No text was found in this PDF. It may contain only images or scanned content.");
-                }
-            } catch (error) {
-                loadingDiv.remove();
-                console.error("PDF extraction failed:", error);
-                addMessageToUI(`Failed to extract text from PDF: ${error}`, "user");
-            }
-        };
-        reader.readAsDataURL(file);
+
+            const extractedText = await invoke<string>("extract_text_from_pdf", { base64Data });
+            loadingDiv.remove();
+            await processFileResult(fileName, "pdf", base64Data, extractedText);
+        } catch (error) {
+            showToast(`Failed to process PDF: ${error}`, "error");
+        }
         return;
     }
-    
-    // Text files
+
     const text = await file.text();
     const codeExtensions = ['js', 'ts', 'html', 'css', 'py', 'java', 'cpp', 'c', 'h', 'rs', 'go', 'rb', 'php', 'sql', 'json', 'xml'];
-    
+
     let prompt = '';
     if (codeExtensions.includes(fileExtension)) {
         prompt = `Here's a ${fileExtension.toUpperCase()} file named "${fileName}":\n\n\`\`\`${fileExtension}\n${text}\n\`\`\`\n\nPlease analyze this code and provide insights.`;
     } else {
         prompt = `Here's the content of "${fileName}":\n\n${text}\n\nPlease analyze this content.`;
     }
-    
+
     messageInput.value = prompt;
     autoResize();
     messageInput.focus();
@@ -1845,22 +1777,29 @@ fileInput?.addEventListener("change", async () => {
     fileInput.value = '';
 });
 
-// Drag and drop
-document.addEventListener('dragover', (e) => {
+// Drag and drop via standard DOM events (reliable in all webviews)
+let mainDragTimeout: ReturnType<typeof setTimeout> | null = null;
+
+document.addEventListener('dragenter', (e) => {
     e.preventDefault();
+    if (mainDragTimeout) clearTimeout(mainDragTimeout);
     dragOverlay.classList.add('active');
 });
 
-document.addEventListener('dragleave', (e) => {
-    if (e.relatedTarget === null) {
+document.addEventListener('dragleave', () => {
+    mainDragTimeout = setTimeout(() => {
         dragOverlay.classList.remove('active');
-    }
+    }, 80);
+});
+
+document.addEventListener('dragover', (e) => {
+    e.preventDefault();
 });
 
 document.addEventListener('drop', async (e) => {
     e.preventDefault();
+    if (mainDragTimeout) clearTimeout(mainDragTimeout);
     dragOverlay.classList.remove('active');
-    
     const files = e.dataTransfer?.files;
     if (files && files.length > 0) {
         await handleFile(files[0]);
@@ -2332,6 +2271,7 @@ async function init() {
     await loadTheme();
     await loadRTL();
     await loadSidebar();
+    await loadCloseToTray();
     await loadThinkingMode();
     await loadReasoningEffort();
     await loadSearchEnabled();

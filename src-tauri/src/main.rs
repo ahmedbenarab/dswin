@@ -12,7 +12,7 @@ use tauri_plugin_clipboard_manager::ClipboardExt;
 use window_vibrancy::apply_mica;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use base64::Engine;
 use futures_util::StreamExt;
 use chrono::Local;
@@ -128,18 +128,51 @@ fn main() {
             #[cfg(target_os = "windows")]
             let _ = apply_mica(&window, Some(true));
             
-            // Apply Mica to mini window
+            // Apply Mica to mini window with debounced focus-loss hide
             #[cfg(target_os = "windows")]
             if let Some(mini) = app.get_webview_window("mini") {
                 let _ = apply_mica(&mini, Some(true));
-                
-                // Hide mini window when it loses focus
+
                 let mini_clone = mini.clone();
+                let last_resize: Arc<Mutex<std::time::Instant>> = Arc::new(Mutex::new(std::time::Instant::now()));
+                let debounce: Arc<Mutex<Option<std::thread::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
+
                 mini.on_window_event(move |event| {
-                    if let tauri::WindowEvent::Focused(is_focused) = event {
-                        if !is_focused {
-                            let _ = mini_clone.hide();
+                    match event {
+                        tauri::WindowEvent::Resized(_) => {
+                            if let Ok(mut t) = last_resize.lock() {
+                                *t = std::time::Instant::now();
+                            }
                         }
+                        tauri::WindowEvent::Focused(is_focused) => {
+                            let mini = mini_clone.clone();
+                            let db = debounce.clone();
+                            let lr = last_resize.clone();
+                            if !is_focused {
+                                let recently_resized = lr.lock()
+                                    .map(|t| t.elapsed() < std::time::Duration::from_millis(400))
+                                    .unwrap_or(false);
+                                if recently_resized {
+                                    return;
+                                }
+                                if let Ok(mut guard) = db.lock() {
+                                    if let Some(h) = guard.take() {
+                                        h.join().ok();
+                                    }
+                                    *guard = Some(std::thread::spawn(move || {
+                                        std::thread::sleep(std::time::Duration::from_millis(300));
+                                        let _ = mini.hide();
+                                    }));
+                                }
+                            } else {
+                                if let Ok(mut guard) = db.lock() {
+                                    if let Some(h) = guard.take() {
+                                        h.join().ok();
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 });
             }
@@ -224,6 +257,9 @@ fn main() {
             get_thinking_mode,
             save_reasoning_effort,
             get_reasoning_effort,
+            save_close_to_tray,
+            get_close_to_tray,
+            quit_app,
             save_rtl,
             get_rtl,
             save_sidebar,
@@ -784,6 +820,25 @@ async fn send_message_stream(
     }
     
     output
+}
+
+#[tauri::command]
+fn quit_app(app: tauri::AppHandle) {
+    app.exit(0);
+}
+
+#[tauri::command]
+fn save_close_to_tray(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
+    let store = app.store("settings.json").map_err(|e| e.to_string())?;
+    store.set("close_to_tray", serde_json::Value::Bool(enabled));
+    store.save().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn get_close_to_tray(app: tauri::AppHandle) -> Result<Option<bool>, String> {
+    let store = app.store("settings.json").map_err(|e| e.to_string())?;
+    Ok(store.get("close_to_tray").and_then(|v| v.as_bool()))
 }
 
 #[tauri::command]
